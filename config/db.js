@@ -11,7 +11,6 @@ async function connectDB() {
     return client.db("Hospital_CRM");
   } catch (error) {
     console.error("MongoDB Connection Failed:", error);
-  
   }
 }
 
