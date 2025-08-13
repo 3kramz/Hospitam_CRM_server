@@ -8,10 +8,11 @@ async function connectDB() {
   try {
     await client.connect();
     console.log("MongoDB Connected...");
-    return client.db("Hospital_CRM");
+    return client.db("Hospital_crn");
   } catch (error) {
     console.error("MongoDB Connection Failed:", error);
   }
 }
+
 
 module.exports = connectDB;
