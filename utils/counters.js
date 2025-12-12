@@ -6,7 +6,6 @@ async function getNextPID(countersCollection) {
   );
 
   const seqNumber = result?.seq ?? 1;
-  console.log(result)
   return `P-${seqNumber.toString().padStart(3, "0")}`;
 }
 

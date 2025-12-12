@@ -10,17 +10,15 @@ module.exports = (db, verifyToken) => {
 
 
   // /save-patient-bill
-router.post("/", verifyToken, async (req, res) => {
+  router.post("/", verifyToken, async (req, res) => {
     try {
       const { patientInfo, tests, discounts, payment, grandTotal } = req.body;
       if (!tests || !tests.length) {
         return res.status(400).json({ success: false, error: "No tests selected" });
       }
-
       let patient = await patientsCollection.findOne({ pid: patientInfo.pid });
 
       if (!patient) {
-        // Create new patient if not found
         const pid = await getNextPID(countersCollection);
         const newPatient = {
           pid,
@@ -79,50 +77,126 @@ router.post("/", verifyToken, async (req, res) => {
   });
 
 
-router.get("/all-reports", verifyToken, async (req, res) => {
+  router.get("/all-reports", verifyToken, async (req, res) => {
+    try {
+      const page = parseInt(req.query.page) || 1;
+      const limit = parseInt(req.query.limit) || 10;
+      const search = req.query.search || "";
+      const statusFilter = req.query.status || "";
+      const paymentFilter = req.query.payment || "";
+      const skip = (page - 1) * limit;
 
-  try {
-    const testGroups = await testGroupsCollection
-      .find({})
-      .sort({ createdAt: -1 }) // latest first
-      .toArray();
-      
-    const reports = await Promise.all(
-      testGroups.map(async (group) => {
-        const patient = await patientsCollection.findOne({ _id: new ObjectId(group.patientId) });
-        if (!patient) return null;
 
-        // Calculate totals
-        const total = group.tests.reduce((sum, t) => sum + (t.price || 0), 0);
-        const discount = group.tests.reduce((sum, t) => sum + (t.discount || 0), 0);
-        const netTotal = total - discount;
-        const payment = group.payment || 0;
+      const pipeline = [
+        {
+          $lookup: {
+            from: "patients",
+            localField: "patientId",
+            foreignField: "_id",
+            as: "patientInfo"
+          }
+        },
+        { $unwind: { path: "$patientInfo", preserveNullAndEmptyArrays: true } },
 
-        return {
-          id: group._id.toString(),
-          invoiceId: group._id.toString().slice(-8), // last 6 chars as Invoice ID
-          patientId: patient.pid,
-          patientName: patient.name,
-          address:patient.address,
-          total: total,
-          discount: discount,
-          vat: 0,
-          payment: payment,
-          status: payment >= netTotal ? "PAID" : "DUE",
-          createdAt: group.createdAt,
-        };
-      })
-    );
+        {
+          $addFields: {
+            totalAmount: { $sum: "$tests.price" },
+            totalDiscount: { $sum: "$tests.discount" },
+          }
+        },
+        {
+          $addFields: {
+            netAmount: { $subtract: ["$totalAmount", "$totalDiscount"] }
+          }
+        },
+        {
+          $addFields: {
+            paymentStatus: {
+              $cond: { if: { $gte: ["$payment", "$netAmount"] }, then: "PAID", else: "DUE" }
+            },
+            isPaid: { $gt: ["$payment", 0] }
+          }
+        }
+      ];
 
-    res.json(reports.filter(r => r !== null));
-  } catch (err) {
-    console.error("Error fetching all reports:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
+      // 2. Build Match Object
+      let matchQuery = {};
 
-    router.get("/:groupId", async (req, res) => {
-   
+      if (search) {
+        const regex = { $regex: search, $options: "i" };
+        matchQuery.$or = [
+          { "patientInfo.name": regex },
+          { "patientInfo.pid": regex },
+          { "patientInfo.phone": regex },
+        ];
+      }
+
+      if (statusFilter) {
+        matchQuery.paymentStatus = statusFilter.toUpperCase();
+      }
+
+      if (paymentFilter) {
+        if (paymentFilter === 'paid') {
+          matchQuery.payment = { $gt: 0 };
+        } else if (paymentFilter === 'unpaid') {
+          matchQuery.payment = { $eq: 0 };
+        }
+      }
+
+      if (Object.keys(matchQuery).length > 0) {
+        pipeline.push({ $match: matchQuery });
+      }
+
+      // 3. Sort
+      pipeline.push({ $sort: { createdAt: -1 } });
+
+      // 4. Facet
+      pipeline.push({
+        $facet: {
+          metadata: [{ $count: "total" }],
+          data: [
+            { $skip: skip },
+            { $limit: limit },
+            {
+              $project: {
+                _id: 1,
+                id: { $toString: "$_id" },
+                invoiceId: { $substr: [{ $toString: "$_id" }, 16, 8] },
+                patientId: { $ifNull: ["$patientInfo.pid", "N/A"] },
+                patientName: { $ifNull: ["$patientInfo.name", "Unknown"] },
+                address: { $ifNull: ["$patientInfo.address", ""] },
+                contact: { $ifNull: ["$patientInfo.phone", ""] },
+                totalDue: { $subtract: ["$netAmount", "$payment"] },
+                payment: 1,
+                status: "$paymentStatus",
+                createdAt: 1
+              }
+            }
+          ]
+        }
+      });
+
+
+      const results = await testGroupsCollection.aggregate(pipeline).toArray();
+
+      const data = results[0].data;
+      const totalCount = results[0].metadata[0] ? results[0].metadata[0].total : 0;
+
+      res.json({
+        reports: data,
+        totalCount: totalCount,
+        currentPage: page,
+        totalPages: Math.ceil(totalCount / limit)
+      });
+
+    } catch (err) {
+      console.error("Error fetching reports:", err);
+      res.status(500).json({ error: "Server error" });
+    }
+  });
+
+  router.get("/:groupId", async (req, res) => {
+
     try {
       const groupId = req.params.groupId;
       if (!ObjectId.isValid(groupId)) {
@@ -134,13 +208,11 @@ router.get("/all-reports", verifyToken, async (req, res) => {
         return res.status(404).json({ error: "Test group not found" });
       }
 
-      // Fetch patient info for this group
       const patient = await patientsCollection.findOne({ _id: new ObjectId(testGroup.patientId) });
       if (!patient) {
         return res.status(404).json({ error: "Patient not found" });
       }
 
-      // Prepare response data
       const response = {
         ...testGroup,
         patientInfo: {
@@ -148,8 +220,8 @@ router.get("/all-reports", verifyToken, async (req, res) => {
           name: patient.name,
           age: patient.age,
           gender: patient.gender,
-          address:patient.address,
-          email:patient.email,
+          address: patient.address,
+          email: patient.email,
           phone: patient.phone,
           refDoctor: patient.refDoctor,
           pcName: patient.pcName,
@@ -157,7 +229,7 @@ router.get("/all-reports", verifyToken, async (req, res) => {
         },
         previousDue: patient.dueAmount || 0,
         totalDiscount: testGroup.tests.reduce((sum, t) => sum + (t.discount || 0), 0),
-        vat: 0, // if you add VAT later, calculate here
+        vat: 0,
       };
 
       res.json(response);
