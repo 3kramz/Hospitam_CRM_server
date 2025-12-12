@@ -12,13 +12,13 @@ app.use(cors());
 async function startServer() {
   const db = await connectDB();
 
-  const { jwtRouter, verifyToken, verifyAdmin } = jwtModule(db);
+  const { jwtRouter, verifyToken, verifyAdmin, verifyLabExpert } = jwtModule(db);
 
   const base = require("./routes/base")(db, verifyToken);
   const users = require("./routes/users")(db, verifyToken, verifyAdmin);
   const patients = require("./routes/patients/patients")(db, verifyToken);
   const doctors = require("./routes/doctors/doctors")(db, verifyToken);
-  const tests = require("./routes/tests/tests")(db, verifyToken);
+  const tests = require("./routes/tests/tests")(db, verifyToken, verifyLabExpert);
 
   app.use("/", base);
   app.use("/jwt", jwtRouter);

@@ -62,9 +62,29 @@ module.exports = (db) => {
     }
   };
 
+  // Verify Lab Expert Middleware
+  const verifyLabExpert = async (req, res, next) => {
+    const email = req.decoded?.email;
+    if (!email) {
+      return res.status(403).send({ message: "Forbidden access: no email in token" });
+    }
+
+    try {
+      const user = await usersCollection.findOne({ email });
+      if (user?.role !== "lab_expert" && user?.role !== "admin") {
+        return res.status(403).send({ message: "Forbidden access: not a lab expert" });
+      }
+      next();
+    } catch (err) {
+      console.error("Lab Expert check failed:", err);
+      res.status(500).send({ message: "Server error" });
+    }
+  };
+
   return {
     jwtRouter: router,
     verifyToken,
     verifyAdmin,
+    verifyLabExpert,
   };
 };
