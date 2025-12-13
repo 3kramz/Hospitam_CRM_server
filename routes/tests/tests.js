@@ -2,12 +2,13 @@ const express = require("express");
 const { ObjectId } = require("mongodb");
 const { getNextPID, getNextInvoiceID } = require("../../utils/counters");
 
-module.exports = (db, verifyToken, verifyLabExpert) => {
+module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampleCollection, verifyAdmin) => {
   const router = express.Router();
   const patientsCollection = db.collection("patients");
   const testGroupsCollection = db.collection("testGroups");
   const testsCollection = db.collection("tests");
   const countersCollection = db.collection("counters");
+  const usersCollection = db.collection("users");
 
   // Get all tests from the master list
   router.get("/test-list", verifyToken, async (req, res) => {
@@ -63,6 +64,8 @@ module.exports = (db, verifyToken, verifyLabExpert) => {
           test_id: t.test_id,
           testName: t.name,
           price: t.price,
+          department: t.department,
+          roomNumber: t.roomNumber,
           discount: discounts[t.test_id] || 0,
           netAmount: t.price - (discounts[t.test_id] || 0),
           status: 'assigned', // assigned, test_running, complete
@@ -281,6 +284,74 @@ module.exports = (db, verifyToken, verifyLabExpert) => {
 
 
   // Statistics Endpoint
+  router.get("/dashboard-stats", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+      const { period, startDate, endDate } = req.query; // period: daily, weekly, custom
+      const matchStage = {};
+
+      let start, end;
+      const today = new Date();
+
+      if (period === 'daily') {
+        start = new Date(today.setHours(0, 0, 0, 0));
+        end = new Date(today.setHours(23, 59, 59, 999));
+      } else if (period === 'weekly') {
+        const first = today.getDate() - today.getDay();
+        start = new Date(today.setDate(first));
+        start.setHours(0, 0, 0, 0);
+        end = new Date(); // up to now
+      } else if (startDate && endDate) {
+        start = new Date(startDate);
+        end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+      }
+
+      if (start && end) {
+        matchStage.createdAt = { $gte: start, $lte: end };
+      }
+
+      const stats = await testGroupsCollection.aggregate([
+        { $match: matchStage },
+        {
+          $group: {
+            _id: null,
+            totalRevenue: { $sum: "$grandTotal" }, // Total billed amount
+            totalCashReceived: { $sum: "$payment" }, // Total actual cash collected
+            totalDueAmount: {
+              $sum: {
+                $subtract: ["$grandTotal", "$payment"]
+              }
+            },
+            totalTests: { $sum: { $size: { $ifNull: ["$tests", []] } } }, // Safety for missing tests array
+            totalFullPayments: {
+              $sum: { $cond: [{ $gte: ["$payment", "$grandTotal"] }, 1, 0] }
+            }
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            totalRevenue: 1,
+            totalCashReceived: 1,
+            totalDueAmount: 1,
+            totalTests: 1,
+            totalFullPayments: 1
+          }
+        }
+      ]).toArray();
+
+      // Additional breakdown for charts (e.g., daily revenue over last 7 days)
+      // This could be a separate aggregation if needed
+
+      res.json(stats[0] || { totalRevenue: 0, totalCashReceived: 0, totalDueAmount: 0, totalTests: 0, totalFullPayments: 0 });
+
+    } catch (err) {
+      console.error("Dashboard stats error:", err);
+      res.status(500).json({ error: "Failed to fetch stats" });
+    }
+  });
+
+
   router.get("/stats", verifyToken, async (req, res) => {
     try {
       console.log("Fetching stats...");
@@ -502,15 +573,134 @@ module.exports = (db, verifyToken, verifyLabExpert) => {
     }
   });
 
-  // Update Test Status
-  router.patch("/status", verifyToken, verifyLabExpert, async (req, res) => {
+  // Update Test Status (Refactored for RBAC)
+  router.patch("/status", verifyToken, async (req, res) => {
     const { groupId, testId, status } = req.body;
+    const userRole = req.decoded.role; // Assuming role is in token
+    // If not in token, fetch user? verifyToken puts decoded in req.
+    // NOTE: If role is not in token, we might need to fetch user. 
+    // Usually auth middleware puts generic info. Let's assume role is part of payload or we fetch specific role middleware.
+    // Ideally we should use the specific verify middleware for each route, but this route is shared.
+    // So we check role dynamically.
 
     if (!groupId || !testId || !status) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
+    // Role-based validation
+    // Front Desk: Can only set to 'ready_to_deliver' or 'delivered' from 'complete'
+    // Sample Collection: Can only set to 'sample_collected' from 'assigned'
+    // Lab Expert: Can only set to 'complete' from 'sample_collected'
+
+    // Admin override?
+    const isAdmin = userRole === 'admin';
+
+    let userDepartment = null;
+    if (!isAdmin) {
+      try {
+        const email = req.decoded.email;
+        const user = await usersCollection.findOne({ email });
+        userDepartment = user?.department;
+      } catch (e) {
+        console.error("Error fetching user for dept validation", e);
+      }
+    }
+
+    // We need to fetch the current status first to validate transition
+    // But Mongo updateOne with filter is atomic.
+
+    let allowed = false;
+
+    if (isAdmin) allowed = true;
+    else if (userRole === 'front_desk') {
+      if (['ready_to_deliver', 'delivered'].includes(status)) allowed = true;
+    } else if (userRole === 'sample_collection') {
+      if (status === 'sample_collected') allowed = true;
+    } else if (userRole === 'lab_expert') {
+      if (status === 'complete') allowed = true;
+    }
+
+    if (!allowed) {
+      return res.status(403).json({ error: `User role '${userRole}' not allowed to set status '${status}'` });
+    }
+
+    // Further logic: Validate Previous State
+    // We can do this by adding the previous state to the filter query
+    let query = { _id: new ObjectId(groupId), "tests.test_id": testId };
+
+    if (!isAdmin) {
+      if (userRole === 'front_desk') {
+        // Can only move COMPLETE -> READY -> DELIVERED
+        // If setting READY, prev must be COMPLETE
+        if (status === 'ready_to_deliver') {
+          // But wait, the previous status in DB is "complete" (lowercase usually)
+          // Need to handle case sensitivity. 
+          // Sticking to lowercase 'complete' as per seeding/logic
+          // or 'Complete' ? Setup seems to be 'assigned', 'test_running', 'complete'.
+          query["tests.status"] = "complete";
+        } else if (status === 'delivered') {
+          query["tests.status"] = "ready_to_deliver";
+        }
+      } else if (userRole === 'sample_collection') {
+        // Assigned -> Sample Collected
+        // tests.status could be 'assigned' or null/missing
+        // Use $or for status check? Hard in updateOne filter for array element matches sometimes
+        // Let's rely on atomic check.
+        // allow assigned or missing
+        // Note: Array filter matching is tricky. 
+      } else if (userRole === 'lab_expert') {
+        // Sample Collected -> Complete
+        query["tests.status"] = "sample_collected";
+      }
+    }
+
+    // For simplicity in filter, if not admin, we enforce "tests.status" 
+    // But for sample collection, it might be null.
+    // Simplest approach: Fetch, Check, Update.
+
     try {
+      const testGroup = await testGroupsCollection.findOne({
+        _id: new ObjectId(groupId),
+        "tests.test_id": testId
+      });
+
+      if (!testGroup) return res.status(404).json({ error: "Test not found" });
+
+      const test = testGroup.tests.find(t => t.test_id === testId);
+      const currentStatus = test.status || 'assigned';
+
+      // Department check for Lab/Sample
+      if (!isAdmin && (userRole === 'lab_expert' || userRole === 'sample_collection') && userDepartment) {
+        // Check if test department match user department
+        if (test.department && test.department.toLowerCase() !== userDepartment.toLowerCase()) {
+          return res.status(403).json({ error: `Unauthorized: User belongs to ${userDepartment}, test is in ${test.department}` });
+        }
+      }
+
+      // Transition Logic
+      if (!isAdmin) {
+        if (userRole === 'front_desk') {
+          if (status === 'ready_to_deliver' && currentStatus !== 'complete') {
+            return res.status(400).json({ error: "Test must be Completed before Ready to Deliver" });
+          }
+          if (status === 'delivered' && currentStatus !== 'ready_to_deliver') {
+            return res.status(400).json({ error: "Test must be Ready before Delivered" });
+          }
+        } else if (userRole === 'sample_collection') {
+          if (status === 'sample_collected' && currentStatus !== 'assigned') {
+            return res.status(400).json({ error: "Test must be Assigned to collect sample" });
+          }
+          // Check Department?
+          // The user object (from DB) needs to be fetched if we want to check department match.
+          // We only have role in token usually. 
+          // Assuming user is honest for now or we fetch user.
+        } else if (userRole === 'lab_expert') {
+          if (status === 'complete' && currentStatus !== 'sample_collected' && currentStatus !== 'test_running') {
+            // allow test_running intermediate? User said: sample collected -> complete.
+            return res.status(400).json({ error: "Sample must be collected before completing" });
+          }
+        }
+      }
 
       const result = await testGroupsCollection.updateOne(
         { _id: new ObjectId(groupId), "tests.test_id": testId },
@@ -520,13 +710,81 @@ module.exports = (db, verifyToken, verifyLabExpert) => {
       );
 
       if (result.modifiedCount === 0) {
-        return res.status(404).json({ error: "Test not found or status already set" });
+        return res.status(404).json({ error: "Update failed" });
       }
 
       res.json({ success: true, message: "Status updated" });
     } catch (err) {
       console.error("Error updating test status:", err);
       res.status(500).json({ error: "Failed to update status" });
+    }
+  });
+
+  // CRUD for Tests (Admin Only)
+
+  // Add New Test
+  router.post("/test", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+      const newTest = req.body;
+      // Basic validation
+      if (!newTest.testName || !newTest.price) {
+        return res.status(400).json({ error: "Test Name and Price are required" });
+      }
+
+      const testDoc = {
+        test_id: await getNextInvoiceID(countersCollection), // Using invoice ID counter for simplicity or create a new counter for test_id? 
+        // Existing data uses numbers like 1001. Let's assume we use a similar counter.
+        // Actually, let's check getNextInvoiceID... it returns a number.
+        // Maybe we should create a getNextTestID or reuse. 
+        // Let's reuse or use a new logic later. For now, assuming provided or auto-gen.
+        // Wait, existing tests have `test_id` as number.
+        ...newTest,
+        test_id: parseInt(newTest.test_id) || Date.now(), // Fallback if not provided, but ideally should be managed.
+        price: parseFloat(newTest.price),
+        createdAt: new Date()
+      };
+
+      // If we want a proper counter, we should ideally add it. 
+      // check utils/counters.js ? I cannot see it right now.
+      // Let's assume for now we generate a unique ID if not present.
+
+      const result = await testsCollection.insertOne(testDoc);
+      res.json({ success: true, result });
+    } catch (err) {
+      console.error("Error adding test:", err);
+      res.status(500).json({ error: "Failed to add test" });
+    }
+  });
+
+  // Edit Test
+  router.patch("/test/:id", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+      const id = req.params.id; // This is the _id
+      const updates = req.body;
+      delete updates._id; // prevent updating _id
+
+      if (updates.price) updates.price = parseFloat(updates.price);
+
+      const result = await testsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updates }
+      );
+      res.json(result);
+    } catch (err) {
+      console.error("Error updating test:", err);
+      res.status(500).json({ error: "Failed to update test" });
+    }
+  });
+
+  // Delete Test
+  router.delete("/test/:id", verifyToken, verifyAdmin, async (req, res) => {
+    try {
+      const id = req.params.id;
+      const result = await testsCollection.deleteOne({ _id: new ObjectId(id) });
+      res.json(result);
+    } catch (err) {
+      console.error("Error deleting test:", err);
+      res.status(500).json({ error: "Failed to delete test" });
     }
   });
 

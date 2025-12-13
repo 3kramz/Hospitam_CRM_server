@@ -1,4 +1,5 @@
 const express = require("express");
+const { ObjectId } = require("mongodb");
 
 module.exports = (db, verifyToken, verifyAdmin) => {
   const router = express.Router();
@@ -23,6 +24,8 @@ module.exports = (db, verifyToken, verifyAdmin) => {
     if (!newUser.email || !newUser.name || !newUser.role) {
       return res.status(400).send({ message: "Name, email and role are required" });
     }
+    // Optional: Validate department for lab/collection roles?
+    // if ((newUser.role === 'lab_expert' || newUser.role === 'sample_collection') && !newUser.department) { ... }
 
     try {
       const result = await usersCollection.insertOne(newUser);
@@ -58,6 +61,19 @@ module.exports = (db, verifyToken, verifyAdmin) => {
     } catch (error) {
       console.error("Error updating role:", error);
       res.status(500).send({ message: "Failed to update role" });
+    }
+  });
+
+  // DELETE user (admin only)
+  router.delete("/:id", verifyToken, verifyAdmin, async (req, res) => {
+    const id = req.params.id;
+    try {
+      const query = { _id: new ObjectId(id) };
+      const result = await usersCollection.deleteOne(query);
+      res.send(result);
+    } catch (error) {
+      console.error("Error deleting user:", error);
+      res.status(500).send({ message: "Failed to delete user" });
     }
   });
 

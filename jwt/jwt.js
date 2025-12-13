@@ -80,11 +80,48 @@ module.exports = (db) => {
       res.status(500).send({ message: "Server error" });
     }
   };
+  // Verify Front Desk Middleware
+  const verifyFrontDesk = async (req, res, next) => {
+    const email = req.decoded?.email;
+    if (!email) {
+      return res.status(403).send({ message: "Forbidden access: no email in token" });
+    }
+    try {
+      const user = await usersCollection.findOne({ email });
+      if (user?.role !== "front_desk" && user?.role !== "admin") {
+        return res.status(403).send({ message: "Forbidden access: not front desk" });
+      }
+      next();
+    } catch (err) {
+      console.error("Front Desk check failed:", err);
+      res.status(500).send({ message: "Server error" });
+    }
+  };
+
+  // Verify Sample Collection Middleware
+  const verifySampleCollection = async (req, res, next) => {
+    const email = req.decoded?.email;
+    if (!email) {
+      return res.status(403).send({ message: "Forbidden access: no email in token" });
+    }
+    try {
+      const user = await usersCollection.findOne({ email });
+      if (user?.role !== "sample_collection" && user?.role !== "admin") {
+        return res.status(403).send({ message: "Forbidden access: not sample collection" });
+      }
+      next();
+    } catch (err) {
+      console.error("Sample Collection check failed:", err);
+      res.status(500).send({ message: "Server error" });
+    }
+  };
 
   return {
     jwtRouter: router,
     verifyToken,
     verifyAdmin,
     verifyLabExpert,
+    verifyFrontDesk,
+    verifySampleCollection
   };
 };

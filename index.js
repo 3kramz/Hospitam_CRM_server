@@ -12,20 +12,20 @@ app.use(cors());
 async function startServer() {
   const db = await connectDB();
 
-  const { jwtRouter, verifyToken, verifyAdmin, verifyLabExpert } = jwtModule(db);
+  const { jwtRouter, verifyToken, verifyAdmin, verifyLabExpert, verifyFrontDesk, verifySampleCollection } = jwtModule(db);
 
   const base = require("./routes/base")(db, verifyToken);
   const users = require("./routes/users")(db, verifyToken, verifyAdmin);
   const patients = require("./routes/patients/patients")(db, verifyToken);
   const doctors = require("./routes/doctors/doctors")(db, verifyToken);
-  const tests = require("./routes/tests/tests")(db, verifyToken, verifyLabExpert);
+  const tests = require("./routes/tests/tests")(db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampleCollection, verifyAdmin);
 
   app.use("/", base);
   app.use("/jwt", jwtRouter);
   app.use("/users", users);
   app.use("/patients", patients);
   app.use("/doctors", doctors);
-  app.use("/save-patient-bill", tests)
+  app.use("/tests", tests)
 
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
