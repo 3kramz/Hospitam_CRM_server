@@ -21,11 +21,14 @@ module.exports = (db, verifyToken, verifyAdmin) => {
 
   router.post("/", verifyToken, verifyAdmin, async (req, res) => {
     const newUser = req.body;
-    if (!newUser.email || !newUser.name || !newUser.role) {
-      return res.status(400).send({ message: "Name, email and role are required" });
+    // Basic validation (allow role OR roles)
+    if (!newUser.email || !newUser.name || (!newUser.role && (!newUser.roles || newUser.roles.length === 0))) {
+      return res.status(400).send({ message: "Name, email and role(s) are required" });
     }
-    // Optional: Validate department for lab/collection roles?
-    // if ((newUser.role === 'lab_expert' || newUser.role === 'sample_collection') && !newUser.department) { ... }
+
+    // Normalize to arrays
+    if (newUser.role && !newUser.roles) newUser.roles = [newUser.role];
+    if (newUser.department && !newUser.departments) newUser.departments = [newUser.department];
 
     try {
       const result = await usersCollection.insertOne(newUser);
@@ -42,25 +45,37 @@ module.exports = (db, verifyToken, verifyAdmin) => {
     res.send(user);
   });
 
-  // PATCH update user role (admin only)
+  // PATCH update user role/access (admin only)
   router.patch("/role", verifyToken, verifyAdmin, async (req, res) => {
-    const { email, role } = req.body;
-    if (!email || !role) {
-      return res.status(400).send({ message: "Email and new role are required" });
+    // We expect { email, role?, roles?, department?, departments? }
+    const { email, role, roles, department, departments } = req.body;
+    if (!email) {
+      return res.status(400).send({ message: "Email is required" });
     }
 
     try {
       const query = { email: email };
+      const updateFields = {};
+
+      if (roles) updateFields.roles = roles;
+      else if (role) updateFields.roles = [role]; // Fallback if old frontend used
+
+      if (departments) updateFields.departments = departments;
+      else if (department) updateFields.departments = [department];
+
+      // Also update single fields for potential backward compat if needed (optional)
+      if (role) updateFields.role = role;
+      if (department) updateFields.department = department;
+
       const updateDoc = {
-        $set: {
-          role: role
-        }
+        $set: updateFields
       };
+
       const result = await usersCollection.updateOne(query, updateDoc);
       res.send(result);
     } catch (error) {
-      console.error("Error updating role:", error);
-      res.status(500).send({ message: "Failed to update role" });
+      console.error("Error updating user access:", error);
+      res.status(500).send({ message: "Failed to update user access" });
     }
   });
 

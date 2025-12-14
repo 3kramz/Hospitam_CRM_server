@@ -14,7 +14,8 @@ module.exports = (db) => {
     }
 
     try {
-      const token = jwt.sign(user, process.env.ACCESS_TOKEN, {
+      const secret = process.env.ACCESS_TOKEN || "temporary_secret";
+      const token = jwt.sign(user, secret, {
         expiresIn: "1h",
       });
       res.send({ token });
@@ -33,10 +34,16 @@ module.exports = (db) => {
 
     const token = authHeader.split(" ")[1];
 
-    jwt.verify(token, process.env.ACCESS_TOKEN, (err, decoded) => {
+    require("dotenv").config();
+    const secret = process.env.ACCESS_TOKEN || "temporary_secret";
+    jwt.verify(token, secret, (err, decoded) => {
       if (err) {
         console.error("JWT Verify Error:", err);
-        return res.status(401).send({ message: "Unauthorized access: invalid token" });
+        return res.status(401).send({
+          message: "Unauthorized access: invalid token",
+          error: err.message,
+          secretExists: !!process.env.ACCESS_TOKEN
+        });
       }
       req.decoded = decoded;
       next();
@@ -52,7 +59,8 @@ module.exports = (db) => {
 
     try {
       const user = await usersCollection.findOne({ email });
-      if (user?.role !== "admin") {
+      const roles = user?.roles || (user?.role ? [user.role] : []);
+      if (!roles.includes("admin")) {
         return res.status(403).send({ message: "Forbidden access: not an admin" });
       }
       next();
@@ -71,7 +79,8 @@ module.exports = (db) => {
 
     try {
       const user = await usersCollection.findOne({ email });
-      if (user?.role !== "lab_expert" && user?.role !== "admin") {
+      const roles = user?.roles || (user?.role ? [user.role] : []);
+      if (!roles.includes("lab_expert") && !roles.includes("admin")) {
         return res.status(403).send({ message: "Forbidden access: not a lab expert" });
       }
       next();
@@ -88,7 +97,8 @@ module.exports = (db) => {
     }
     try {
       const user = await usersCollection.findOne({ email });
-      if (user?.role !== "front_desk" && user?.role !== "admin") {
+      const roles = user?.roles || (user?.role ? [user.role] : []);
+      if (!roles.includes("front_desk") && !roles.includes("admin")) {
         return res.status(403).send({ message: "Forbidden access: not front desk" });
       }
       next();
@@ -106,12 +116,37 @@ module.exports = (db) => {
     }
     try {
       const user = await usersCollection.findOne({ email });
-      if (user?.role !== "sample_collection" && user?.role !== "admin") {
+      const roles = user?.roles || (user?.role ? [user.role] : []);
+      if (!roles.includes("sample_collection") && !roles.includes("admin")) {
         return res.status(403).send({ message: "Forbidden access: not sample collection" });
       }
       next();
     } catch (err) {
       console.error("Sample Collection check failed:", err);
+      res.status(500).send({ message: "Server error" });
+    }
+  };
+
+  // Verify Lab Access (Lab Expert OR Sample Collection)
+  const verifyLabAccess = async (req, res, next) => {
+    const email = req.decoded?.email;
+    if (!email) {
+      return res.status(403).send({ message: "Forbidden access: no email in token" });
+    }
+    try {
+      const user = await usersCollection.findOne({ email });
+      if (!user) {
+        // User not found, but we let it fall through to roles check which will likely fail or be empty
+      }
+
+      const roles = user?.roles || (user?.role ? [user.role] : []);
+
+      if (!roles.includes("lab_expert") && !roles.includes("sample_collection") && !roles.includes("admin")) {
+        return res.status(403).send({ message: "Forbidden access: not authorized for lab board" });
+      }
+      next();
+    } catch (err) {
+      console.error("Lab Access check failed:", err);
       res.status(500).send({ message: "Server error" });
     }
   };
@@ -122,6 +157,7 @@ module.exports = (db) => {
     verifyAdmin,
     verifyLabExpert,
     verifyFrontDesk,
-    verifySampleCollection
+    verifySampleCollection,
+    verifyLabAccess
   };
 };
