@@ -27,7 +27,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
   // /save-patient-bill
   router.post("/save-patient-bill", verifyToken, async (req, res) => {
     try {
-      const { patientInfo, tests, discounts, payment, grandTotal } = req.body;
+      const { patientInfo, tests, discounts, payment, grandTotal, enteredBy } = req.body;
       if ((!tests || !tests.length) && (!payment || payment <= 0)) {
         return res.status(400).json({ success: false, error: "No tests selected and no payment made." });
       }
@@ -61,6 +61,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         invoiceId,
         patientId: patient._id,
         pid: patient.pid,
+        enteredBy: enteredBy || req.decoded?.email || "Unknown", // Save the creator
         tests: tests.map((t) => ({
           test_id: t.test_id,
           testName: t.name,

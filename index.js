@@ -9,26 +9,46 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-async function startServer() {
-  const db = await connectDB();
+let db;
+let routesInitialized = false;
 
-  const { jwtRouter, verifyToken, verifyAdmin, verifyLabExpert, verifyFrontDesk, verifySampleCollection, verifyLabAccess } = jwtModule(db);
+async function initializeRoutes() {
+  if (routesInitialized) return;
 
-  const base = require("./routes/base")(db, verifyToken);
-  const users = require("./routes/users")(db, verifyToken, verifyAdmin);
-  const patients = require("./routes/patients/patients")(db, verifyToken);
-  const doctors = require("./routes/doctors/doctors")(db, verifyToken);
-  const tests = require("./routes/tests/tests")(db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampleCollection, verifyAdmin, verifyLabAccess);
+  try {
+    db = await connectDB();
+    const { jwtRouter, verifyToken, verifyAdmin, verifyLabExpert, verifyFrontDesk, verifySampleCollection, verifyLabAccess } = jwtModule(db);
 
-  app.use("/", base);
-  app.use("/jwt", jwtRouter);
-  app.use("/users", users);
-  app.use("/patients", patients);
-  app.use("/doctors", doctors);
-  app.use("/tests", tests)
+    const base = require("./routes/base")(db, verifyToken);
+    const users = require("./routes/users")(db, verifyToken, verifyAdmin);
+    const patients = require("./routes/patients/patients")(db, verifyToken);
+    const doctors = require("./routes/doctors/doctors")(db, verifyToken);
+    const tests = require("./routes/tests/tests")(db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampleCollection, verifyAdmin, verifyLabAccess);
 
-  const PORT = process.env.PORT || 5000;
-  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+    app.use("/", base);
+    app.use("/jwt", jwtRouter);
+    app.use("/users", users);
+    app.use("/patients", patients);
+    app.use("/doctors", doctors);
+    app.use("/tests", tests);
+
+    routesInitialized = true;
+  } catch (error) {
+    console.error("Failed to initialize routes:", error);
+    throw error;
+  }
 }
 
-startServer();
+// Vercel Serverless Handler
+module.exports = async (req, res) => {
+  await initializeRoutes();
+  return app(req, res);
+};
+
+// Local Development
+if (require.main === module) {
+  initializeRoutes().then(() => {
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  });
+}
