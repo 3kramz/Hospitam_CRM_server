@@ -4,7 +4,7 @@ module.exports = (db, verifyToken) => {
   const router = express.Router();
   const doctorsCollection = db.collection("doctors");
 
-  router.get("/search", async (req, res) => {
+  router.get("/search", verifyToken, async (req, res) => {
     try {
       const q = req.query.q?.trim();
       if (!q) return res.json([]);

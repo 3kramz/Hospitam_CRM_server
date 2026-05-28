@@ -42,6 +42,9 @@ module.exports = (db, verifyToken, verifyAdmin) => {
   router.get("/user/:email", verifyToken, async (req, res) => {
     const email = req.params.email;
     const user = await usersCollection.findOne({ email });
+    if (!user) {
+      return res.status(404).send({ message: "User profile not found" });
+    }
     res.send(user);
   });
 

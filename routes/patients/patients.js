@@ -1,29 +1,39 @@
 const express = require("express");
 const { getNextPID } = require("../../utils/counters");
 
-module.exports = (db, verifyToken) => {
+module.exports = (db, verifyToken, verifyFrontDesk) => {
   const router = express.Router();
   const patientsCollection = db.collection("patients");
   const countersCollection = db.collection("counters");
 
   // Get all patients with pagination
-  router.get("/all", verifyToken, async (req, res) => {
+  router.get("/all", verifyToken, verifyFrontDesk, async (req, res) => {
     try {
       const page = parseInt(req.query.page) || 1;
       const limit = parseInt(req.query.limit) || 20;
       const skip = (page - 1) * limit;
       const search = req.query.search || "";
+      const dueOnly = req.query.dueOnly === "true";
+
+      // Sort support
+      const allowedSortFields = { pid: "pid", name: "name", age: "age", dueAmount: "dueAmount", createdAt: "createdAt", updatedAt: "updatedAt" };
+      const sortField = allowedSortFields[req.query.sort] || "updatedAt";
+      const sortOrder = req.query.order === "asc" ? 1 : -1;
 
       let query = {};
       if (search) {
         const regex = new RegExp(search, "i");
         query = { $or: [{ name: regex }, { phone: regex }, { pid: regex }] };
       }
+      // Due-only filter: only patients with outstanding balance
+      if (dueOnly) {
+        query.dueAmount = { $gt: 0 };
+      }
 
       const total = await patientsCollection.countDocuments(query);
       const patients = await patientsCollection
         .find(query)
-        .sort({ updatedAt: -1 })
+        .sort({ [sortField]: sortOrder })
         .skip(skip)
         .limit(limit)
         .toArray();
@@ -41,7 +51,7 @@ module.exports = (db, verifyToken) => {
   });
 
   // Get patient history
-  router.get("/:pid/history", verifyToken, async (req, res) => {
+  router.get("/:pid/history", verifyToken, verifyFrontDesk, async (req, res) => {
     try {
       const { pid } = req.params;
       const patient = await patientsCollection.findOne({ pid });
@@ -63,7 +73,7 @@ module.exports = (db, verifyToken) => {
   });
 
   // Search patients
-  router.get("/search", async (req, res) => {
+  router.get("/search", verifyToken, verifyFrontDesk, async (req, res) => {
     try {
       const q = req.query.q?.trim();
       if (!q) return res.json([]);
@@ -80,7 +90,7 @@ module.exports = (db, verifyToken) => {
   });
 
   // Save patient
-  router.post("/save", verifyToken, async (req, res) => {
+  router.post("/save", verifyToken, verifyFrontDesk, async (req, res) => {
     try {
       const { patientInfo } = req.body;
       if (!patientInfo)

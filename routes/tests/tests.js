@@ -2,6 +2,12 @@ const express = require("express");
 const { ObjectId } = require("mongodb");
 const { getNextPID, getNextInvoiceID } = require("../../utils/counters");
 
+const normalizeStatus = (value) =>
+  String(value || "assigned").toLowerCase().replace(/\s+/g, "_");
+
+const normalizeDept = (value) =>
+  String(value || "").toLowerCase().replace(/\s+/g, "_");
+
 module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampleCollection, verifyAdmin, verifyLabAccess) => {
   const router = express.Router();
   const patientsCollection = db.collection("patients");
@@ -25,11 +31,15 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
 
   // /save-patient-bill
   // /save-patient-bill
-  router.post("/save-patient-bill", verifyToken, async (req, res) => {
+  router.post("/save-patient-bill", verifyToken, verifyFrontDesk, async (req, res) => {
     try {
-      const { patientInfo, tests, discounts, payment, grandTotal, enteredBy } = req.body;
+      const { patientInfo, tests, discounts = {}, payment, enteredBy } = req.body;
       if ((!tests || !tests.length) && (!payment || payment <= 0)) {
         return res.status(400).json({ success: false, error: "No tests selected and no payment made." });
+      }
+      const paymentAmount = Number(payment || 0);
+      if (Number.isNaN(paymentAmount) || paymentAmount < 0) {
+        return res.status(400).json({ success: false, error: "Invalid payment amount" });
       }
       let patient = await patientsCollection.findOne({ pid: patientInfo.pid });
 
@@ -53,7 +63,38 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         const insertResult = await patientsCollection.insertOne(newPatient);
         patient = { ...newPatient, _id: insertResult.insertedId };
       }
-      const updatedDue = grandTotal - (payment || 0);
+
+      // Server-side billing truth (do not trust client totals)
+      const previousDue = Number(patient?.dueAmount || 0);
+      if (Number.isNaN(previousDue) || previousDue < 0) {
+        return res.status(400).json({ success: false, error: "Invalid previous due amount for patient" });
+      }
+
+      const safeTests = Array.isArray(tests) ? tests : [];
+      const normalizedTests = safeTests.map((t) => {
+        const price = Number(t.price || 0);
+        if (Number.isNaN(price) || price < 0) {
+          throw new Error(`Invalid test price for test_id=${t?.test_id}`);
+        }
+        const rawDiscount = Number(discounts?.[t.test_id] || 0);
+        const discount = Math.min(Math.max(rawDiscount, 0), price);
+        return {
+          test_id: t.test_id,
+          testName: t.name || t.testName,
+          price,
+          department: t.department || t.dep || "",
+          roomNumber: t.roomNumber,
+          discount,
+          netAmount: price - discount,
+          status: "assigned",
+        };
+      });
+
+      const testsTotal = normalizedTests.reduce((sum, t) => sum + t.price, 0);
+      const totalDiscount = normalizedTests.reduce((sum, t) => sum + t.discount, 0);
+      const netAmount = testsTotal - totalDiscount;
+      const grandTotal = netAmount + previousDue;
+      const updatedDue = Math.max(grandTotal - paymentAmount, 0);
 
       const invoiceId = await getNextInvoiceID(countersCollection);
 
@@ -62,17 +103,12 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         patientId: patient._id,
         pid: patient.pid,
         enteredBy: enteredBy || req.decoded?.email || "Unknown", // Save the creator
-        tests: tests.map((t) => ({
-          test_id: t.test_id,
-          testName: t.name,
-          price: t.price,
-          department: t.department,
-          roomNumber: t.roomNumber,
-          discount: discounts[t.test_id] || 0,
-          netAmount: t.price - (discounts[t.test_id] || 0),
-          status: 'assigned', // assigned, test_running, complete
-        })),
-        payment,
+        previousDue,
+        testsTotal,
+        totalDiscount,
+        netAmount,
+        tests: normalizedTests,
+        payment: paymentAmount,
         grandTotal,
         createdAt: new Date(),
       };
@@ -90,6 +126,9 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         patientId: patient._id.toString(),
         pid: patient.pid,
         groupId: groupId.toString(),
+        previousDue,
+        grandTotal,
+        updatedDue,
       });
     } catch (err) {
       console.error("Save bill error:", err);
@@ -98,7 +137,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
   });
 
 
-  router.get("/all-reports", verifyToken, async (req, res) => {
+  router.get("/all-reports", verifyToken, verifyFrontDesk, async (req, res) => {
     try {
       const page = parseInt(req.query.page) || 1;
       const limit = parseInt(req.query.limit) || 10;
@@ -168,7 +207,18 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         statusMatch.paymentStatus = statusFilter.toUpperCase();
       }
       if (testStatusFilter) {
-        statusMatch["tests.status"] = { $regex: new RegExp(`^${testStatusFilter}$`, "i") };
+        // Map raw snake_case status keys (from /stats) to computedTestStatus labels
+        const statusLabelMap = {
+          assigned: "Assigned",
+          collecting_sample: "Collecting Sample",
+          sample_collected: "Sample Collected",
+          test_running: "Running",
+          complete: "Complete",
+          ready_to_deliver: "Ready to Deliver",
+          delivered: "Delivered",
+        };
+        const mappedLabel = statusLabelMap[testStatusFilter.toLowerCase()] || testStatusFilter;
+        statusMatch.computedTestStatus = { $regex: new RegExp(`^${mappedLabel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, "i") };
       }
       if (paymentFilter) {
         if (paymentFilter === 'paid') statusMatch.payment = { $gt: 0 };
@@ -205,42 +255,74 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
       pipeline.push(
         {
           $addFields: {
+            // Backward compatible: older docs may not have these fields
             totalAmount: { $sum: "$tests.price" },
-            totalDiscount: { $sum: "$tests.discount" },
+            totalDiscount: { $ifNull: ["$totalDiscount", { $sum: "$tests.discount" }] },
+            previousDue: { $ifNull: ["$previousDue", 0] },
           }
         },
         {
           $addFields: {
-            netAmount: { $subtract: ["$totalAmount", "$totalDiscount"] }
+            netAmount: { $ifNull: ["$netAmount", { $subtract: ["$totalAmount", "$totalDiscount"] }] }
+          }
+        },
+        {
+          $addFields: {
+            grandTotalComputed: { $ifNull: ["$grandTotal", { $add: ["$netAmount", "$previousDue"] }] },
           }
         },
         {
           $addFields: {
             paymentStatus: {
-              $cond: { if: { $gte: ["$payment", "$netAmount"] }, then: "PAID", else: "DUE" }
+              $cond: { if: { $gte: ["$payment", "$grandTotalComputed"] }, then: "PAID", else: "DUE" }
             },
             isPaid: { $gt: ["$payment", 0] },
-            totalDue: { $subtract: ["$netAmount", "$payment"] },
+            totalDue: { $max: [{ $subtract: ["$grandTotalComputed", "$payment"] }, 0] },
             // Calculate Test Status Logic
             computedTestStatus: {
               $switch: {
                 branches: [
-                  // If any test is running
+                  // Terminal group states first (receptionist handoff flow)
+                  {
+                    case: {
+                      $and: [
+                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
+                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "delivered"] } } } }, 0] }
+                      ]
+                    },
+                    then: "Delivered"
+                  },
+                  {
+                    case: {
+                      $and: [
+                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
+                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "ready_to_deliver"] } } } }, 0] }
+                      ]
+                    },
+                    then: "Ready to Deliver"
+                  },
+                  {
+                    case: {
+                      $and: [
+                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
+                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "complete"] } } } }, 0] }
+                      ]
+                    },
+                    then: "Complete"
+                  },
+                  // In-progress states (any test in phase)
                   {
                     case: { $in: ["test_running", { $ifNull: ["$tests.status", []] }] },
                     then: "Running"
                   },
-                  // If any is collecting sample
                   {
                     case: { $in: ["collecting_sample", { $ifNull: ["$tests.status", []] }] },
                     then: "Collecting Sample"
                   },
-                  // If any is sample collected (and not running/collecting) -> implies others might be assigned or collected
                   {
                     case: { $in: ["sample_collected", { $ifNull: ["$tests.status", []] }] },
                     then: "Sample Collected"
                   },
-                  // If any is assigned (or null/empty status), report is Assigned/Pending
                   {
                     case: {
                       $gt: [
@@ -256,41 +338,9 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
                       ]
                     },
                     then: "Assigned"
-                  },
-                  // Check if ALL are delivered
-                  {
-                    case: {
-                      $and: [
-                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
-                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "delivered"] } } } }, 0] }
-                      ]
-                    },
-                    then: "Delivered"
-                  },
-                  // Check if ALL are ready_to_deliver
-                  {
-                    case: {
-                      $and: [
-                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
-                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "ready_to_deliver"] } } } }, 0] }
-                      ]
-                    },
-                    then: "Ready to Deliver"
-                  },
-                  // Check if ALL are complete (or ready/delivered - strict complete check)
-                  // Actually if it's mixed 'complete' and 'ready', it's technically 'Complete' (waiting for all to be ready).
-                  // But for simplicity, let's say ALL must be complete to show 'Complete'.
-                  {
-                    case: {
-                      $and: [
-                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
-                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "complete"] } } } }, 0] }
-                      ]
-                    },
-                    then: "Complete"
                   }
                 ],
-                default: { $ifNull: [{ $arrayElemAt: ["$tests.status", 0] }, "Assigned"] } // Fallback to first test status if unknown
+                default: { $ifNull: [{ $arrayElemAt: ["$tests.status", 0] }, "Assigned"] }
               }
             }
           }
@@ -353,9 +403,9 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
 
 
   // Statistics Endpoint
-  router.get("/dashboard-stats", verifyToken, async (req, res) => {
+  router.get("/dashboard-stats", verifyToken, verifyFrontDesk, async (req, res) => {
     try {
-      const { period, startDate, endDate } = req.query; // period: daily, weekly, custom
+      const { period, startDate, endDate } = req.query;
       const matchStage = {};
 
       let start, end;
@@ -368,7 +418,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         const first = today.getDate() - today.getDay();
         start = new Date(today.setDate(first));
         start.setHours(0, 0, 0, 0);
-        end = new Date(); // up to now
+        end = new Date();
       } else if (startDate && endDate) {
         start = new Date(startDate);
         end = new Date(endDate);
@@ -379,116 +429,125 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         matchStage.createdAt = { $gte: start, $lte: end };
       }
 
-      const stats = await testGroupsCollection.aggregate([
-        { $match: matchStage },
-        {
-          $facet: {
-            // 1. Overall Summary Stats
-            summary: [
-              {
-                $group: {
-                  _id: null,
-                  totalRevenue: { $sum: "$grandTotal" },
-                  totalCashReceived: { $sum: "$payment" },
-                  totalDueAmount: { $sum: { $subtract: ["$grandTotal", "$payment"] } },
-                  totalTests: { $sum: { $size: { $ifNull: ["$tests", []] } } },
-                  totalFullPayments: { $sum: { $cond: [{ $gte: ["$payment", "$grandTotal"] }, 1, 0] } },
-                  totalCompleted: {
-                    $sum: {
-                      $size: {
-                        $filter: {
-                          input: { $ifNull: ["$tests", []] },
-                          as: "t",
-                          cond: { $eq: [{ $toLower: { $ifNull: ["$$t.status", "assigned"] } }, "complete"] }
-                        }
-                      }
-                    }
-                  },
-                  totalRunning: {
-                    $sum: {
-                      $size: {
-                        $filter: {
-                          input: { $ifNull: ["$tests", []] },
-                          as: "t",
-                          cond: {
-                            $or: [
-                              { $eq: [{ $toLower: { $ifNull: ["$$t.status", "assigned"] } }, "running"] },
-                              { $eq: [{ $toLower: { $ifNull: ["$$t.status", "assigned"] } }, "test_running"] }
-                            ]
+      // Run testGroups aggregation and patients due sum in parallel
+      const [testGroupStats, patientDueResult] = await Promise.all([
+        testGroupsCollection.aggregate([
+          { $match: matchStage },
+          {
+            $facet: {
+              summary: [
+                {
+                  $group: {
+                    _id: null,
+                    totalRevenue: { $sum: "$grandTotal" },
+                    totalCashReceived: { $sum: "$payment" },
+                    totalTests: { $sum: { $size: { $ifNull: ["$tests", []] } } },
+                    totalFullPayments: { $sum: { $cond: [{ $gte: ["$payment", "$grandTotal"] }, 1, 0] } },
+                    totalCompleted: {
+                      $sum: {
+                        $size: {
+                          $filter: {
+                            input: { $ifNull: ["$tests", []] },
+                            as: "t",
+                            cond: { $eq: [{ $toLower: { $ifNull: ["$$t.status", "assigned"] } }, "complete"] }
                           }
                         }
                       }
-                    }
-                  },
-                  totalAssigned: {
-                    $sum: {
-                      $size: {
-                        $filter: {
-                          input: { $ifNull: ["$tests", []] },
-                          as: "t",
-                          cond: {
-                            $or: [
-                              { $eq: [{ $toLower: { $ifNull: ["$$t.status", "assigned"] } }, "assigned"] },
-                              { $eq: ["$$t.status", null] },
-                              { $eq: ["$$t.status", ""] }
-                            ]
+                    },
+                    totalRunning: {
+                      $sum: {
+                        $size: {
+                          $filter: {
+                            input: { $ifNull: ["$tests", []] },
+                            as: "t",
+                            cond: {
+                              $or: [
+                                { $eq: [{ $toLower: { $ifNull: ["$$t.status", "assigned"] } }, "running"] },
+                                { $eq: [{ $toLower: { $ifNull: ["$$t.status", "assigned"] } }, "test_running"] }
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    },
+                    totalAssigned: {
+                      $sum: {
+                        $size: {
+                          $filter: {
+                            input: { $ifNull: ["$tests", []] },
+                            as: "t",
+                            cond: {
+                              $or: [
+                                { $eq: [{ $toLower: { $ifNull: ["$$t.status", "assigned"] } }, "assigned"] },
+                                { $eq: ["$$t.status", null] },
+                                { $eq: ["$$t.status", ""] }
+                              ]
+                            }
                           }
                         }
                       }
                     }
                   }
+                },
+                {
+                  $project: {
+                    _id: 0,
+                    totalRevenue: 1,
+                    totalCashReceived: 1,
+                    totalTests: 1,
+                    totalFullPayments: 1,
+                    totalCompleted: 1,
+                    totalRunning: 1,
+                    totalAssigned: 1
+                  }
                 }
-              },
-              {
-                $project: {
-                  _id: 0,
-                  totalRevenue: 1,
-                  totalCashReceived: 1,
-                  totalDueAmount: 1,
-                  totalTests: 1,
-                  totalFullPayments: 1,
-                  totalCompleted: 1,
-                  totalRunning: 1,
-                  totalAssigned: 1
+              ],
+              chartData: [
+                {
+                  $project: {
+                    dateStr: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                    grandTotal: 1,
+                    payment: 1
+                  }
+                },
+                {
+                  $group: {
+                    _id: "$dateStr",
+                    revenue: { $sum: "$grandTotal" },
+                    cash: { $sum: "$payment" },
+                    due: { $sum: { $subtract: ["$grandTotal", "$payment"] } }
+                  }
+                },
+                { $sort: { _id: 1 } },
+                {
+                  $project: {
+                    name: "$_id",
+                    revenue: 1,
+                    cash: 1,
+                    due: 1,
+                    _id: 0
+                  }
                 }
-              }
-            ],
-            // 2. Chart Data (Daily Breakdown)
-            chartData: [
-              {
-                $project: {
-                  dateStr: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-                  grandTotal: 1,
-                  payment: 1
-                }
-              },
-              {
-                $group: {
-                  _id: "$dateStr",
-                  revenue: { $sum: "$grandTotal" }, // Revenue = Billed Amount
-                  cash: { $sum: "$payment" }, // Cash = Received
-                  due: { $sum: { $subtract: ["$grandTotal", "$payment"] } } // Due
-                }
-              },
-              { $sort: { _id: 1 } }, // Sort by date ascending
-              {
-                $project: {
-                  name: "$_id", // for chart x-axis
-                  revenue: 1,
-                  cash: 1,
-                  due: 1,
-                  _id: 0
-                }
-              }
-            ]
+              ]
+            }
           }
-        }
-      ]).toArray();
+        ]).toArray(),
 
-      const summary = stats[0].summary[0] || {
+        // Always sum the live dueAmount from patients — this is the single source of truth
+        // since it's updated every time a payment is made (including due payments).
+        patientsCollection.aggregate([
+          {
+            $group: {
+              _id: null,
+              totalDueAmount: { $sum: { $max: ["$dueAmount", 0] } }
+            }
+          }
+        ]).toArray()
+      ]);
+
+      const summary = testGroupStats[0]?.summary[0] || {
         totalRevenue: 0,
         totalCashReceived: 0,
-        totalDueAmount: 0,
         totalTests: 0,
         totalFullPayments: 0,
         totalCompleted: 0,
@@ -496,11 +555,12 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         totalAssigned: 0
       };
 
-      const chartData = stats[0].chartData || [];
+      // Use patients.dueAmount as the authoritative outstanding due
+      const totalDueAmount = patientDueResult[0]?.totalDueAmount || 0;
 
+      const chartData = testGroupStats[0]?.chartData || [];
 
-
-      res.json({ ...summary, chartData });
+      res.json({ ...summary, totalDueAmount, chartData });
 
     } catch (err) {
       console.error("Dashboard stats error:", err);
@@ -509,14 +569,74 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
   });
 
 
-  router.get("/stats", verifyToken, async (req, res) => {
+  router.get("/stats", verifyToken, verifyFrontDesk, async (req, res) => {
     try {
+      const { startDate, endDate, search, status: paymentStatus } = req.query;
 
-      const stats = await testGroupsCollection.aggregate([
+      const pipeline = [];
+
+      // 1. Optional Date Filter
+      if (startDate || endDate) {
+        const dateMatch = { createdAt: {} };
+        if (startDate) dateMatch.createdAt.$gte = new Date(startDate);
+        if (endDate) {
+          const end = new Date(endDate);
+          end.setHours(23, 59, 59, 999);
+          dateMatch.createdAt.$lte = end;
+        }
+        pipeline.push({ $match: dateMatch });
+      }
+
+      // 2. Optional Payment Status Filter (Paid / Due)
+      if (paymentStatus) {
+        // Compute paymentStatus before filtering
+        pipeline.push(
+          {
+            $addFields: {
+              grandTotalComputed: { $ifNull: ["$grandTotal", { $add: [{ $subtract: [{ $sum: "$tests.price" }, { $ifNull: ["$totalDiscount", { $sum: "$tests.discount" }] }] }, { $ifNull: ["$previousDue", 0] }] }] }
+            }
+          },
+          {
+            $match: {
+              $expr: paymentStatus.toUpperCase() === "PAID"
+                ? { $gte: ["$payment", "$grandTotalComputed"] }
+                : { $lt: ["$payment", "$grandTotalComputed"] }
+            }
+          }
+        );
+      }
+
+      // 3. Optional Search Filter (requires patient lookup)
+      if (search) {
+        pipeline.push(
+          {
+            $lookup: {
+              from: "patients",
+              localField: "patientId",
+              foreignField: "_id",
+              as: "patientInfo"
+            }
+          },
+          { $unwind: { path: "$patientInfo", preserveNullAndEmptyArrays: true } },
+          {
+            $match: {
+              $or: [
+                { "invoiceId": { $regex: search, $options: "i" } },
+                { "patientInfo.name": { $regex: search, $options: "i" } },
+                { "patientInfo.pid": { $regex: search, $options: "i" } },
+                { "patientInfo.phone": { $regex: search, $options: "i" } }
+              ]
+            }
+          }
+        );
+      }
+
+      // 4. Unwind tests and aggregate counts
+      pipeline.push(
         { $unwind: "$tests" },
         {
           $group: {
-            _id: { $toLower: { $ifNull: ["$tests.status", "assigned"] } }, // Group by status, default to 'assigned'
+            _id: { $toLower: { $ifNull: ["$tests.status", "assigned"] } },
             count: { $sum: 1 }
           }
         },
@@ -525,10 +645,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
             _id: null,
             totalTests: { $sum: "$count" },
             statusCounts: {
-              $push: {
-                status: "$_id",
-                count: "$count"
-              }
+              $push: { status: "$_id", count: "$count" }
             }
           }
         },
@@ -547,10 +664,10 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
             }
           }
         }
-      ]).toArray();
+      );
 
+      const stats = await testGroupsCollection.aggregate(pipeline).toArray();
       const result = stats[0] || { totalTests: 0, statusCounts: {} };
-
 
       res.json(result);
     } catch (err) {
@@ -648,6 +765,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
             gender: "$patientInfo.gender",
             testName: "$tests.testName",
             testId: "$tests.test_id", // The generic test ID
+            department: "$tests.department",
             status: "$tests.status",
             price: "$tests.price",
             date: "$createdAt",
@@ -665,7 +783,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
     }
   });
 
-  router.get("/:groupId", async (req, res) => {
+  router.get("/:groupId", verifyToken, verifyFrontDesk, async (req, res) => {
 
     try {
       const groupId = req.params.groupId;
@@ -697,8 +815,8 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
           pcName: patient.pcName,
           dueAmount: patient.dueAmount,
         },
-        previousDue: testGroup.grandTotal - (testGroup.tests.reduce((sum, t) => sum + (t.price - (t.discount || 0)), 0)) || 0,
-        totalDiscount: testGroup.tests.reduce((sum, t) => sum + (t.discount || 0), 0),
+        previousDue: Number(testGroup.previousDue || 0),
+        totalDiscount: Number(testGroup.totalDiscount || testGroup.tests.reduce((sum, t) => sum + (t.discount || 0), 0)),
         vat: 0,
       };
 
@@ -713,7 +831,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
   router.patch("/group-status", verifyToken, async (req, res) => {
     const { groupId, status } = req.body;
     const email = req.decoded?.email;
-    let userRole = req.decoded.role;
+    let userRoles = req.decoded?.roles || [];
 
     if (!groupId || !status) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -722,19 +840,21 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
     try {
       const user = await usersCollection.findOne({ email });
       if (user) {
-        userRole = user.role;
+        userRoles = user.roles || (user.role ? [user.role] : []);
       }
     } catch (e) {
       console.error(e);
       return res.status(500).json({ error: "Auth Error" });
     }
 
-    if (!userRole) return res.status(403).json({ error: "Unauthorized" });
+    if (!userRoles || userRoles.length === 0) return res.status(403).json({ error: "Unauthorized" });
 
     // Logic for Front Desk: Complete -> Ready -> Delivered
+    const isAdmin = userRoles.includes("admin");
+    const isFrontDesk = userRoles.includes("front_desk");
     let allowed = false;
-    if (userRole === 'admin') allowed = true;
-    if (userRole === 'front_desk' && ['ready_to_deliver', 'delivered'].includes(status)) allowed = true;
+    if (isAdmin) allowed = true;
+    if (isFrontDesk && ["ready_to_deliver", "delivered"].includes(status)) allowed = true;
 
     if (!allowed) {
       return res.status(403).json({ error: "Not authorized for this status change" });
@@ -755,16 +875,23 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
 
       // Pre-check
       const tests = group.tests || [];
-      if (!userRole === 'admin') {
-        if (status === 'ready_to_deliver') {
-          // Ensure all tests are 'complete'
-          const allComplete = tests.every(t => t.status === 'complete' || t.status === 'ready_to_deliver');
-          if (!allComplete) return res.status(400).json({ error: "All tests must be Complete before marking Ready" });
-        } else if (status === 'delivered') {
-          // Ensure all tests are 'ready_to_deliver'
-          const allReady = tests.every(t => t.status === 'ready_to_deliver' || t.status === 'delivered');
-          // if we allow Complete -> Delivered directly? User said: "Complete to ready to deliver and finally delivered". Strict flow.
-          if (!allReady) return res.status(400).json({ error: "All tests must be Ready before marking Delivered" });
+      if (!isAdmin) {
+        if (status === "ready_to_deliver") {
+          const allComplete = tests.every((t) => {
+            const s = normalizeStatus(t.status);
+            return s === "complete" || s === "ready_to_deliver";
+          });
+          if (!allComplete) {
+            return res.status(400).json({ error: "All tests must be Complete before marking Ready" });
+          }
+        } else if (status === "delivered") {
+          const allReady = tests.every((t) => {
+            const s = normalizeStatus(t.status);
+            return s === "ready_to_deliver" || s === "delivered";
+          });
+          if (!allReady) {
+            return res.status(400).json({ error: "All tests must be Ready before marking Delivered" });
+          }
         }
       }
 
@@ -788,7 +915,6 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
   // Update Test Status (Refactored for RBAC)
   router.patch("/status", verifyToken, async (req, res) => {
     const { groupId, testId, status } = req.body;
-    let userRole = req.decoded.role;
     const email = req.decoded?.email;
 
 
@@ -848,42 +974,24 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
       return res.status(403).json({ error: `User roles '${userRoles.join(", ")}' not allowed to set status '${status}'` });
     }
 
-    // Further logic: Validate Previous State
-    // We can do this by adding the previous state to the filter query
-    let query = { _id: new ObjectId(groupId), "tests.test_id": testId };
-
-    if (!isAdmin) {
-      if (userRoles.includes('front_desk')) {
-        // Can only move COMPLETE -> READY -> DELIVERED
-        // If setting READY, prev must be COMPLETE
-        if (status === 'ready_to_deliver') {
-          // But wait, the previous status in DB is "complete" (lowercase usually)
-          // Need to handle case sensitivity.
-          // Sticking to lowercase 'complete' as per seeding/logic
-          // or 'Complete' ? Setup seems to be 'assigned', 'test_running', 'complete'.
-          query["tests.status"] = "complete";
-        } else if (status === 'delivered') {
-          query["tests.status"] = "ready_to_deliver";
-        }
-      }
-      // Query filters removed for lab_expert to rely on explicit validation logic below.
-      // This prevents 404 errors when status logic is valid but query is too strict.
-    }
-
-    // For simplicity in filter, if not admin, we enforce "tests.status"
-    // But for sample collection, it might be null.
-    // Simplest approach: Fetch, Check, Update.
-
     try {
+      if (!ObjectId.isValid(groupId)) {
+        return res.status(400).json({ error: "Invalid groupId" });
+      }
+
       const testGroup = await testGroupsCollection.findOne({
         _id: new ObjectId(groupId),
-        "tests.test_id": testId
       });
 
-      if (!testGroup) return res.status(404).json({ error: "Test not found" });
+      if (!testGroup) return res.status(404).json({ error: "Test group not found" });
 
-      const test = testGroup.tests.find(t => t.test_id === testId);
-      const currentStatus = test.status || 'assigned';
+      const testIndex = testGroup.tests.findIndex(
+        (t) => String(t.test_id) === String(testId)
+      );
+      if (testIndex === -1) return res.status(404).json({ error: "Test not found" });
+
+      const test = testGroup.tests[testIndex];
+      const currentStatus = normalizeStatus(test.status);
 
 
       // Department check for Lab/Sample
@@ -897,7 +1005,10 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         // Let's assume restricted if departments exist in system.
         // If test has no department, maybe allow.
         if (test.department && userDepartments.length > 0) {
-          const hasDeptAccess = userDepartments.some(d => d.toLowerCase() === test.department.toLowerCase());
+          const testDept = normalizeDept(test.department);
+          const hasDeptAccess = userDepartments.some(
+            (d) => normalizeDept(d) === testDept
+          );
           if (!hasDeptAccess) {
             return res.status(403).json({ error: `Unauthorized: User departments [${userDepartments.join(', ')}] do not include ${test.department}` });
           }
@@ -906,48 +1017,49 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
 
       // Transition Logic
       if (!isAdmin) {
-        if (userRoles.includes('front_desk')) {
-          if (status === 'ready_to_deliver' && currentStatus !== 'complete') {
+        if (userRoles.includes("front_desk")) {
+          if (status === "ready_to_deliver" && currentStatus !== "complete") {
             return res.status(400).json({ error: "Test must be Completed before Ready to Deliver" });
           }
-          if (status === 'delivered' && currentStatus !== 'ready_to_deliver') {
+          if (status === "delivered" && currentStatus !== "ready_to_deliver") {
             return res.status(400).json({ error: "Test must be Ready before Delivered" });
           }
         }
 
-        if (userRoles.includes('sample_collection')) {
-          // Assigned -> Collecting -> Collected
-          if (status === 'collecting_sample' && currentStatus !== 'assigned') {
+        if (userRoles.includes("sample_collection")) {
+          if (status === "collecting_sample" && currentStatus !== "assigned") {
             return res.status(400).json({ error: `Test must be Assigned to start collection (Current: ${currentStatus})` });
           }
-          if (status === 'sample_collected' && currentStatus !== 'collecting_sample' && currentStatus !== 'assigned') {
-            // Allow directly marking collected if skipping start? Or enforce strict? 
-            // Let's allow assigned -> collected for flexibility, but prefer collecting_sample -> collected.
+          if (
+            status === "sample_collected" &&
+            currentStatus !== "collecting_sample" &&
+            currentStatus !== "assigned"
+          ) {
             return res.status(400).json({ error: `Test must be in collection phase (Current: ${currentStatus})` });
           }
         }
 
-        if (userRoles.includes('lab_expert')) {
-          // Collected -> Running -> Complete
-          if (status === 'test_running' && currentStatus !== 'sample_collected') {
+        if (userRoles.includes("lab_expert")) {
+          if (status === "test_running" && currentStatus !== "sample_collected") {
             return res.status(400).json({ error: "Sample must be collected before starting test" });
           }
-          if (status === 'complete' && currentStatus !== 'test_running' && currentStatus !== 'sample_collected') {
-            // Allow collected -> complete for flexibility
+          if (
+            status === "complete" &&
+            currentStatus !== "test_running" &&
+            currentStatus !== "sample_collected"
+          ) {
             return res.status(400).json({ error: "Test must be running or collected to complete" });
           }
         }
       }
 
       const result = await testGroupsCollection.updateOne(
-        { _id: new ObjectId(groupId), "tests.test_id": testId },
-        {
-          $set: { "tests.$.status": status }
-        }
+        { _id: new ObjectId(groupId) },
+        { $set: { [`tests.${testIndex}.status`]: status } }
       );
 
-      if (result.modifiedCount === 0) {
-        return res.status(404).json({ error: `Update failed (modifiedCount: 0). Query: ${JSON.stringify(query)}` });
+      if (result.matchedCount === 0) {
+        return res.status(404).json({ error: "Update failed: group not found" });
       }
 
       res.json({ success: true, message: "Status updated" });

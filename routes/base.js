@@ -1,6 +1,6 @@
 const express = require("express");
 
-module.exports = () => {
+module.exports = (db, verifyToken) => {
   const router = express.Router();
   router.get("/", async (req, res) => {
     try {

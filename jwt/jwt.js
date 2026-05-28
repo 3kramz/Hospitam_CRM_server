@@ -4,6 +4,11 @@ const jwt = require("jsonwebtoken");
 module.exports = (db) => {
   const router = express.Router();
   const usersCollection = db.collection("users");
+  const jwtSecret = process.env.ACCESS_TOKEN;
+
+  if (!jwtSecret) {
+    throw new Error("ACCESS_TOKEN environment variable is required");
+  }
 
   // Generate Token
   router.post("/", async (req, res) => {
@@ -14,8 +19,21 @@ module.exports = (db) => {
     }
 
     try {
-      const secret = process.env.ACCESS_TOKEN || "temporary_secret";
-      const token = jwt.sign(user, secret, {
+      const dbUser = await usersCollection.findOne({ email: user.email });
+      const roles = dbUser?.roles || (dbUser?.role ? [dbUser.role] : []);
+
+      // Block token issuance for unknown/non-onboarded staff.
+      if (!dbUser || roles.length === 0) {
+        return res.status(403).send({ message: "User is not authorized for CRM access" });
+      }
+
+      const tokenPayload = {
+        email: user.email,
+        roles,
+        departments: dbUser?.departments || (dbUser?.department ? [dbUser.department] : []),
+      };
+
+      const token = jwt.sign(tokenPayload, jwtSecret, {
         expiresIn: "1h",
       });
       res.send({ token });
@@ -34,15 +52,12 @@ module.exports = (db) => {
 
     const token = authHeader.split(" ")[1];
 
-    require("dotenv").config();
-    const secret = process.env.ACCESS_TOKEN || "temporary_secret";
-    jwt.verify(token, secret, (err, decoded) => {
+    jwt.verify(token, jwtSecret, (err, decoded) => {
       if (err) {
         console.error("JWT Verify Error:", err);
         return res.status(401).send({
           message: "Unauthorized access: invalid token",
-          error: err.message,
-          secretExists: !!process.env.ACCESS_TOKEN
+          error: err.message
         });
       }
       req.decoded = decoded;
@@ -136,7 +151,7 @@ module.exports = (db) => {
     try {
       const user = await usersCollection.findOne({ email });
       if (!user) {
-        // User not found, but we let it fall through to roles check which will likely fail or be empty
+        return res.status(403).send({ message: "Forbidden access: user not found" });
       }
 
       const roles = user?.roles || (user?.role ? [user.role] : []);

@@ -21,7 +21,7 @@ async function initializeRoutes() {
 
     const base = require("./routes/base")(db, verifyToken);
     const users = require("./routes/users")(db, verifyToken, verifyAdmin);
-    const patients = require("./routes/patients/patients")(db, verifyToken);
+    const patients = require("./routes/patients/patients")(db, verifyToken, verifyFrontDesk);
     const doctors = require("./routes/doctors/doctors")(db, verifyToken);
     const tests = require("./routes/tests/tests")(db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampleCollection, verifyAdmin, verifyLabAccess);
 
