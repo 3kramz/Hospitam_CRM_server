@@ -631,22 +631,78 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
         );
       }
 
-      // 4. Unwind tests and aggregate counts
+      // 4. Compute the SAME group-level computedTestStatus as /all-reports uses.
+      //    The old approach unwound individual tests and counted raw test.status,
+      //    but the Reports table shows ONE ROW PER GROUP filtered by computedTestStatus.
+      //    An invoice with 5 tests all "assigned" showed count=5 in stats but count=1
+      //    in the table — they never matched. Fixed by counting groups, not tests.
       pipeline.push(
-        { $unwind: "$tests" },
         {
-          $group: {
-            _id: { $toLower: { $ifNull: ["$tests.status", "assigned"] } },
-            count: { $sum: 1 }
+          $addFields: {
+            computedTestStatus: {
+              $switch: {
+                branches: [
+                  {
+                    case: {
+                      $and: [
+                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
+                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "delivered"] } } } }, 0] }
+                      ]
+                    },
+                    then: "delivered"
+                  },
+                  {
+                    case: {
+                      $and: [
+                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
+                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "ready_to_deliver"] } } } }, 0] }
+                      ]
+                    },
+                    then: "ready_to_deliver"
+                  },
+                  {
+                    case: {
+                      $and: [
+                        { $gt: [{ $size: { $ifNull: ["$tests", []] } }, 0] },
+                        { $eq: [{ $size: { $filter: { input: "$tests", cond: { $ne: ["$$this.status", "complete"] } } } }, 0] }
+                      ]
+                    },
+                    then: "complete"
+                  },
+                  {
+                    case: { $in: ["test_running", { $ifNull: ["$tests.status", []] }] },
+                    then: "test_running"
+                  },
+                  {
+                    case: { $in: ["collecting_sample", { $ifNull: ["$tests.status", []] }] },
+                    then: "collecting_sample"
+                  },
+                  {
+                    case: { $in: ["sample_collected", { $ifNull: ["$tests.status", []] }] },
+                    then: "sample_collected"
+                  },
+                  {
+                    case: {
+                      $gt: [
+                        { $size: { $filter: { input: "$tests", cond: { $in: ["$$this.status", ["assigned", null, ""]] } } } },
+                        0
+                      ]
+                    },
+                    then: "assigned"
+                  }
+                ],
+                default: "assigned"
+              }
+            }
           }
         },
+        // Group by group-level status (counts GROUPS, matches table row counts)
+        { $group: { _id: "$computedTestStatus", count: { $sum: 1 } } },
         {
           $group: {
             _id: null,
             totalTests: { $sum: "$count" },
-            statusCounts: {
-              $push: { status: "$_id", count: "$count" }
-            }
+            statusCounts: { $push: { status: "$_id", count: "$count" } }
           }
         },
         {
@@ -655,11 +711,7 @@ module.exports = (db, verifyToken, verifyLabExpert, verifyFrontDesk, verifySampl
             totalTests: 1,
             statusCounts: {
               $arrayToObject: {
-                $map: {
-                  input: "$statusCounts",
-                  as: "s",
-                  in: { k: "$$s.status", v: "$$s.count" }
-                }
+                $map: { input: "$statusCounts", as: "s", in: { k: "$$s.status", v: "$$s.count" } }
               }
             }
           }
